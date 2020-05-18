@@ -1,0 +1,622 @@
+
+#include <functions/dev_batch_norm.h>
+#include <functions/dev_hadamard.h>
+#include <functions/dev_backprop_convolution.h>
+#include <functions/dev_initializations.h>
+
+#include <device/cuda_utils.h>
+#include <device/handles.h>
+
+#include <core/errors.h>
+
+GLOBAL void ker_compute_batch_variance ( real *input, int rows, int cols, 
+	real *mean, real *output ){
+
+	int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+	real t = 0; 
+
+	if (idx < (rows * cols) ) {
+		int chIdx = idx % rows; 
+		t = input[ idx ] - mean[ chIdx ];
+		output[ idx ] = t * t;
+	}
+}
+
+GLOBAL void ker_compute_ZHat( real *input, int rows, int channels, 
+	real *means, real *variances, real epsilon, real *output ){
+
+	int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+	real t = 0; 
+
+	if (idx < rows * channels ) {
+		int chIdx = idx % rows; 
+		t = input[ idx ] - means[ chIdx ];
+		output[ idx ] = t / sqrt( variances[ chIdx ] + epsilon );
+	}
+}
+
+GLOBAL void ker_compute_rop_first( real *input, int rows, int channels, 
+	real *means, real *output ){
+
+	int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+	real t = 0; 
+
+	if (idx < rows * channels ) {
+		int chIdx = idx % rows; 
+		output[ idx ]  = input[ idx ] - means[ chIdx ];
+	}
+}
+
+GLOBAL void ker_compute_rop_first_scale( real *input, 
+	int rows, int channels, real *variances, real epsilon ){
+
+	int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+	real t = 0; 
+
+	if (idx < rows * channels ) {
+		int chIdx = idx % rows; 
+		input[ idx ]  *= 1./sqrt( epsilon + variances[ chIdx ] ); 
+	}
+}
+
+
+GLOBAL void ker_compute_rop_second (real *z_in, real *means, 
+	real *rop_in, real *output, 
+	int rows, int channels )
+{
+	int idx = threadIdx.x + blockIdx.x * blockDim.x; 
+	real t = 0;
+
+	if (idx < (rows * channels)){
+		int chIdx = (idx % rows); 
+	
+		output[ idx ]  = 2 * ( z_in[ idx ] - means[ chIdx ] ) * rop_in[ idx ]; 
+	}
+}
+
+GLOBAL void ker_compute_rop_second_scale( real *rop_input, 
+	real *zin, real *means, real *output, int rows, int channels )
+{
+	int idx = threadIdx.x + blockIdx.x * blockDim.x; 
+	real t = 0;
+
+	if (idx < (rows * channels)){
+		int chIdx = idx % rows; 
+
+		output[ idx ] = rop_input [ chIdx ] * (zin[ idx ] - means [ chIdx ]); 
+	}
+}
+
+GLOBAL void ker_backprop_batch_norm( 
+	real *sum_across_samples_1, 
+	real *sum_across_samples_2, real *delta, 
+	real *output, 
+	real *variances, real epsilon, 
+	int samples, int channels, int chSize ){
+	
+	int idx = blockDim.x * blockIdx.x + threadIdx.x; 
+
+	if (idx < (channels * chSize * samples)){
+		int chIdx = idx / (chSize * samples);  
+		int imgXY = idx % (chSize);
+
+		output[ idx ] -= sum_across_samples_1[ imgXY ] 
+							- sum_across_samples_2[ imgXY ] * delta[ idx ]; 
+		output[ idx ] /= samples * sqrt(epsilon + variances[ chIdx ] );
+	}
+}
+
+GLOBAL void ker_compute_RI 
+		(real *z_in, real *means, real *rz_in, real *rop_means, real *rI, 
+			real *variance, real epsilon,
+			int samples, int channels, int height, int width) {
+
+	int idx = blockDim.x * blockIdx.x + threadIdx.x; 
+
+	if (idx < (samples * channels * height * width) ){
+		int chIdx = idx / (height * width * samples); 
+		int imgXY = idx % (height * width); 
+
+		rI[ idx ] = 
+			2. * (z_in[ idx ] - means[ chIdx * samples + imgXY ] ) * 
+				  (rz_in[ idx ] - rop_means[ chIdx * samples + imgXY ] );
+
+	}
+}
+
+/*
+	R(I) = -1/(2 * pow( variance + epsilon, 3/2)) * (1/m)
+				Sigma ( 2 ( x_i - mu ) ( Rx_i - (1/m) Sigma (Rx_j) )
+*/
+GLOBAL void ker_rI_scale ( real *variances, real *output, 
+	int height, int width, int channels, int samples, real epsilon )
+{
+	int idx = blockDim.x * blockIdx.x + threadIdx.x; 
+
+	if (idx < (samples * channels * height * width) ){
+		int chIdx = idx / (height * width * samples); 
+		int imgXY = idx % (height * width); 
+
+		output[ idx ] *= -1. / ( samples * pow(epsilon + variances [imgXY], 3./2.)); 
+	}
+}
+
+
+GLOBAL void ker_I_scale
+		(real *variances, real epsilon, int imgSize, int samples, 
+		real *scaledVariances)
+{
+	int idx = blockDim.x * blockIdx.x + threadIdx.x; 
+	if (idx < imgSize){
+		scaledVariances[ idx ] = 1. / ( samples * sqrt( variances[ idx ] + epsilon) ); 	
+	}
+}
+
+GLOBAL void ker_rop_helper (
+		real *scaledVariances, real *rII, int channels, int height, int width, int samples)
+{
+	int idx = blockDim.x * blockIdx.x + threadIdx.x; 
+
+	if (idx < (samples * channels * height * width) ){
+		int chIdx = idx / (height * width * samples); 
+		int imgXY = idx % (height * width); 
+
+		rII[ idx ] *= scaledVariances[ imgXY ] ; 
+
+	}
+}
+
+GLOBAL void ker_compute_rII ( 
+	real *output, real *variances, real epsilon, real *rz_out_scale, 
+	int height, int width, int channels, int samples ){
+
+	int idx = blockDim.x * blockIdx.x + threadIdx.x; 
+	if (idx < (samples * channels * height * width) ){
+		int chIdx = idx / (height * width * samples); 
+		int imgXY = idx % (height * width); 
+
+		output[ idx ] -= rz_out_scale[ idx ] * ( 1./ (samples * (variances[ imgXY ] + epsilon) )); 
+	}
+}
+
+
+/*
+Compute batch mean and variance
+*/
+void computeBatchMeanVariance( real *input, int height, int width, int channels, int samples, 
+	real *output, real *batch_mean, real *batch_variance,  real *devPtr ){
+
+	/*
+		Perform oneVector * incomingData( samples * width * height  X channels
+	*/
+
+	real alpha, beta; 
+	int blocks = (height * width * samples * channels + BLOCK_SIZE - 1) / BLOCK_SIZE ; 
+
+	real *oneVector = devPtr; 
+	real *reshapedInput = oneVector + samples;
+	real *nextDevPtr = reshapedInput + samples * height * width * channels; 
+
+	//reshape the input 
+	//from: H * W * N X Ch
+	//to:   N X H * W * Ch
+	reshapeMatrix( input, samples, channels, height * width, reshapedInput); 
+
+	//begin
+	blocks = (samples + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+	kerInitOneVector <<< blocks, BLOCK_SIZE>>> 
+   	( oneVector, samples);  
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	//mean
+	// oneVector * input( samples * height * width X channels )
+	alpha = 1; beta = 0; 
+	cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, 
+								1, height * width * channels, samples,	
+								&alpha, oneVector, 1, reshapedInput, samples, 
+								&beta, batch_mean, 1) ); 
+	alpha = 1./(real)samples; 
+	cublasCheckError( cublasDscal( cublasHandle, height * width * channels, &alpha, batch_mean, 1 ) ); 
+
+	//variance
+	//one thread per cell. 
+	blocks = (height * width * samples * channels + BLOCK_SIZE - 1) / BLOCK_SIZE ; 
+	ker_compute_batch_variance <<<blocks, BLOCK_SIZE >>> 
+		(reshapedInput, samples, height * width * channels, batch_mean, nextDevPtr ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	alpha = 1; beta = 0; 
+	cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, 
+								1, height * width * channels, samples, 	
+								&alpha, oneVector, 1, nextDevPtr, samples, 
+								&beta, batch_variance, height * width * channels) ); 
+	alpha = 1./(real)samples; 
+	cublasCheckError( cublasDscal( cublasHandle, height * width * channels, &alpha, batch_variance, 1 ) ); 
+}
+
+/*
+	Compute z_hat = z - mu / sqrt( variance + epsilon )
+*/
+void computeZOut( real *input, int rows, int channels, 
+	real *means, real *variances, real epsilon, real *output ){
+
+	int blocks = (rows * channels + BLOCK_SIZE - 1) / BLOCK_SIZE ; 
+
+	ker_compute_ZHat <<<blocks, BLOCK_SIZE>>> 
+		(input, rows, channels, means, variances, epsilon, output ); 	
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+}
+
+void computeBatchNormForward( real *input, int height, int width, int channels, int samples, 
+	real *output, real epsilon, real *devPtr ) {
+
+	real *batch_mean = devPtr; 
+	real *batch_variance = batch_mean + samples; 
+	real *nextDevPtr = batch_variance + samples; 
+
+	computeBatchMeanVariance( input, height, width, channels, samples, 
+		output, batch_mean, batch_variance, nextDevPtr); 
+
+	computeZOut( input, height * width, channels, batch_mean, batch_variance, 
+		epsilon, output ); 
+}
+
+/*
+	df/dZin = ( m df/dzHat_i - Sigma df/dzHat_i - Zhat_i Sigma df/dzHat_j * zHat_j )
+*/
+void batchNormDerivativeHelper (
+	real *delta, real *output, 
+	real *z_out,
+	real *sum_across_samples_1, real *sum_across_samples_2, 
+	int height, int width, int channels, int samples,
+	real *devPtr)
+{
+	real alpha, beta; 
+	int rows = width * height * samples;
+	int numBlocks;
+	
+	real *oneVector = devPtr; 
+	real *nextDevPtr = oneVector + samples;
+	
+	/*
+		scale --> m * df / dzHat_i
+	*/
+	alpha = (real)samples; 
+	cublasCheckError( cublasDscal( cublasHandle, rows * channels, 
+		&alpha, output, 1 ) ); 
+
+	/* Reshaping 
+		samples * height * width X channels 
+			--> 
+		samples X channels * height * width
+	*/
+	reshapeMatrix( delta, samples, channels, height * width, nextDevPtr ); 
+
+	/*
+		Summation across all Images, for a given (x,y) location.
+		Resulting dimensions = channels * width * height
+
+		Sigma df / dzHat_i	
+	*/
+	numBlocks = (samples + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+	kerInitOneVector <<< numBlocks, BLOCK_SIZE>>> 
+   	( oneVector, samples);  
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	alpha = 1.; beta = 0; 
+	cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, 
+								1, channels * height * width, samples, 
+								&alpha, oneVector, 1, delta, height * width * samples, 
+								&beta, sum_across_samples_1, 1 ) ); 
+
+	/*
+		zHat_i * Sigma_{j = 1 : m} (df / dzHat_j) * zhat_j
+	*/
+	//Hadamart product between output and delta... and 
+	//then perform summation. 
+	copy_device( nextDevPtr, z_out, sizeof(real) * rows * channels, 
+			ERROR_MEMCPY_DEVICE_DEVICE ); 
+
+	numBlocks = (rows * channels + BLOCK_SIZE -1) / BLOCK_SIZE ; 
+	ker_hadamard<<<numBlocks, BLOCK_SIZE>>> 
+				(delta, rows * channels, nextDevPtr ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	alpha = 1.; beta = 0; 
+	cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, 
+								1, channels * height * width, samples, 
+								&alpha, oneVector, 1, nextDevPtr, height * width * samples, 
+								&beta, sum_across_samples_2, 1 ) ); 
+}
+
+	
+
+
+/*
+	Derivative Computation Here. 
+
+	
+	df/dZin = [ ( m df/dzHat_i - Sigma df/dzHat_i - Zhat_i Sigma {df/dzHat_j * zHat_j} ) ]
+				 --------------------------------------------------------------------------
+                                    m * sqrt( epsilon + variance )
+
+	df / dzHat =   df 
+					 -------- * gamma
+					   dZout
+
+	zHat = 			(Zin - mu)
+			----------------------------
+			  sqrt( epsilon + variance )
+
+*/
+
+void computeBatchNormDerivative( 
+	real *delta, int height, int width, int channels, int samples, 
+	real *means, real *variance, real *output, 
+	real *zout, real *rdelta, 
+	real epsilon, real *devPtr ){
+
+	real alpha, beta; 
+	int rows = width * height * samples;
+	int numBlocks;
+	
+	real *oneVector = devPtr; 
+	real *sum_across_samples_1 = oneVector + samples; 
+	real *sum_across_samples_2 = sum_across_samples_1 + channels * height * width; 
+	real *nextDevPtr = sum_across_samples_2 + channels * height * width;
+
+	//begin
+	copy_device( output, delta, sizeof(real) * rows * channels, 
+		ERROR_MEMCPY_DEVICE_DEVICE ); 
+
+	//Helper here. 
+	batchNormDerivativeHelper( delta, output, 
+		zout, //rzout,
+		sum_across_samples_1, sum_across_samples_2, 
+		height, width, channels, samples,
+		nextDevPtr ); 
+
+	/* 
+		Compute the backpropation of BatchNorm Layer here. 
+	*/
+	numBlocks = (rows * channels + BLOCK_SIZE -1) / BLOCK_SIZE ; 
+	ker_backprop_batch_norm <<<numBlocks, BLOCK_SIZE>>> 
+		( sum_across_samples_1, sum_across_samples_2, delta, 
+			output, variance, epsilon, samples, channels, height * width ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+}
+
+/*
+	ROp Computatio here. 
+	assumes that Z/RZ are of 2 * volumn storage size. 
+	1. 1 unit of volumn stores the z_hat
+	2. 2 unit of volumn is used to store means, variances
+*/
+
+/*
+	Rz_hat = 
+		1 / (sqrt( variance + epsilon) * { Rz_i - Rmu } + 
+		(z_i - mu) {1/m Sigma 2 * (z_j - mu) [ Rz_j - Rmu ] }
+
+*/
+
+void computeROpBatchNormForward (real *z, real *rz_in, real *rz_out, real *devPtr, 
+	real epsilon, 
+	int height, int width, int channels, int samples, int batchSize )
+{
+	real *means = z + height * width * channels * batchSize ; 
+	real *variances = means + height * width * channels; 
+
+	real *oneVector = devPtr; 
+	real *reshapedInput  = oneVector + samples; 
+	real *rop_means = reshapedInput + height * width * channels * samples;
+	real *rop_means_forward = rop_means + height * width ;
+	real *nextDevPtr = rop_means_forward + height * width * channels; 
+
+	real alpha, beta; 
+	int blocks;
+
+	//begin
+	//reshape the input 
+	//from: H * W * N X Ch
+	//to:   N X H * W * Ch
+	reshapeMatrix( rz_in, samples, channels, height * width, reshapedInput); 
+
+	//Compute Rmu
+	cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, 
+								1, height * width * channels, samples, 	
+								&alpha, oneVector, 1, reshapedInput, samples, 
+								&beta, rop_means, height * width * channels) ); 
+
+	alpha = 1./(real)samples; 
+	cublasCheckError( cublasDscal( cublasHandle, height * width * channels, &alpha, rop_means, 1 ) ); 
+
+	//First Half.
+	blocks = (height * width * channels * samples + BLOCK_SIZE -1) / BLOCK_SIZE ; 
+	ker_compute_rop_first <<<blocks, BLOCK_SIZE>>> 
+		(rz_in, height * width * samples, channels, rop_means, rz_out); 	
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+	
+	//second half.
+	//z_in, means, and the monsterous term here.
+	ker_compute_rop_second <<< blocks, BLOCK_SIZE >>>
+		(z, means, rz_out, nextDevPtr, height * width * samples, channels); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	//Do the summation across images ... for second half.
+	//This needs reshaping now... 
+	reshapeMatrix( nextDevPtr, samples, channels, height * width, reshapedInput ); 
+		
+	//summation across images here. 
+	cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, 	
+							1, samples, height * width * channels, 
+							&alpha, oneVector, 1, reshapedInput, height * width * channels, 
+							&beta, rop_means_forward, samples) ); 
+	//scale
+	alpha = 1./(real)samples; 
+	cublasCheckError( cublasDscal( cublasHandle, height * width * channels, &alpha, rop_means_forward, 1 ) ); 
+
+	ker_compute_rop_second_scale <<< blocks, BLOCK_SIZE >>> 
+		(rop_means_forward, z, means, nextDevPtr, height * width * samples, channels);
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	//Add first-half and second-half together
+	//together compute ROp forward Pass. 
+
+	//scale first here. 
+	ker_compute_rop_first_scale <<< blocks, BLOCK_SIZE >>> 
+		(rz_out, height * width * samples, channels, variances, epsilon); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	//rz_out += rop_means_forward
+	alpha = 1.; 
+	cublasCheckError( cublasDaxpy( cublasHandle, height * width * channels * samples, 
+								&alpha, nextDevPtr, 1, 
+								rz_out, 1 ) ); 
+}
+
+/*
+	Rd_i = (I) * R( II ) + R( I ) * II
+	
+	I 	 = (1/m) * sqrt( variance + epsilon )
+	R(II) = m * Rd_i - Sigma (Rd_j+1 ) 
+						  - RY_i Sigma ( Rd_j Y_j )
+						  - Y_i Sigma ( Rd_j Y_j + d_j RY_j )
+
+	R(I) = -1/(2 * pow( variance + epsilon, 3/2)) * (1/m)
+				Sigma ( 2 ( x_i - mu ) ( Rx_i - (1/m) Sigma (Rx_j) )
+	II  = m Rd_i+1 - Sigma ( Rd_i+1 ) - y_i * Sigma (Rd_j+1 * Y_j )
+
+
+*/
+
+void computeROpBatchNormBackward ( 
+	real *z_in, real *z_out, 
+	real *rz_in, real *rz_out, 
+	real *delta, real *rdelta, 
+	real *delta_in, real epsilon,
+	int height, int width, int channels, int samples, int batchSize, 
+	real *output, real *devPtr )
+{
+	real *means = z_in + height * width * channels * batchSize ; 
+	real *variances = means  + height * width * channels; 
+
+	real *rIIOutput 				= devPtr; 
+	real *sum_across_samples_1 = rIIOutput + height * width * channels; 
+	real *sum_across_samples_2 = sum_across_samples_1 + height * width * channels;
+	real *rop_means 				= sum_across_samples_2 + height * width * channels; 
+	real *oneVector = rop_means + height * width * channels; 
+	real *nextDevPtr = oneVector + height * width * samples; 
+
+	real alpha, beta;
+	int blocks;
+
+	//R( II )	
+	//begin
+	batchNormDerivativeHelper( delta, rIIOutput, 
+		z_out, //rz_out, 
+		sum_across_samples_1, sum_across_samples_2, 
+		height, width, channels, samples, nextDevPtr ); 
+
+	blocks = (height * width * channels * samples + BLOCK_SIZE -1) / BLOCK_SIZE ; 
+	ker_backprop_batch_norm <<<blocks, BLOCK_SIZE>>> 
+		( sum_across_samples_1, sum_across_samples_2, delta, 
+			rIIOutput, variances, epsilon, samples, channels, height * width ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	ker_hadamard_2 <<< blocks, BLOCK_SIZE >>> 
+		( rdelta, z_out, delta, rz_out, 
+			channels * height * width * samples, 
+			 nextDevPtr); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	// column sum here. 
+	cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, 
+								1, height * width * channels, samples, 	
+								&alpha, oneVector, 1, nextDevPtr, height * width * channels, 
+								&beta, rop_means, samples) ); 
+
+	//scale the rz_out with the nextDevPtr
+	ker_compute_rop_first <<<blocks, BLOCK_SIZE >>> 
+		( z_out, height * width, channels, rop_means, nextDevPtr ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	//kernel to compute I * R( II ) sum here. 
+	ker_compute_rII <<< blocks, BLOCK_SIZE >>>
+		(rIIOutput, variances, epsilon, nextDevPtr, 
+			height, width, channels, samples ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+	//end
+
+	// R( I )
+	//rop_means
+	//reshape the input 
+	//from: H * W * N X Ch
+	//to:   N X H * W * Ch
+	reshapeMatrix( rz_in, samples, channels, height * width, nextDevPtr); 
+
+	//Compute Rmu
+	cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, 
+								1, height * width * channels, samples, 	
+								&alpha, oneVector, 1, nextDevPtr, height * width * channels, 
+								&beta, rop_means, samples) ); 
+
+	alpha = 1./(real)samples; 
+	cublasCheckError( cublasDscal( cublasHandle, height * width * channels, &alpha, rop_means, 1 ) ); 
+
+	//Compute R( I )
+	//rI --> 1 x (channels * height * width)
+	ker_compute_RI <<<blocks, BLOCK_SIZE >>>
+		(z_in, means, rz_in, rop_means, sum_across_samples_1,
+			variances, epsilon,
+			samples, channels, height, width);
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	//now sum across all the images here. 
+	cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, 
+								1, height * width * channels, samples, 	
+								&alpha, oneVector, 1, sum_across_samples_1, height * width * channels, 
+								&beta, sum_across_samples_2, samples) ); 
+
+	ker_rI_scale <<<blocks, BLOCK_SIZE >>> 
+		(variances, sum_across_samples_2, height, width, channels, samples, epsilon); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+	// II 
+	// This is stored in delta_in
+	// rdelta_in
+	copy_device( output, rIIOutput, sizeof(real) * channels * height * width * samples, 
+						ERROR_MEMCPY_DEVICE_DEVICE ); 
+
+	// R( I ) * II
+	ker_rop_helper <<<blocks, BLOCK_SIZE >>> 
+		( sum_across_samples_2, output, channels, height, width, samples ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+
+	//
+	// Combined Output here. 
+	// R(I) * II + I * R(II)
+	//
+	alpha = 1.;
+	cublasCheckError( cublasDaxpy( cublasHandle, height * width * channels * samples, 
+								&alpha, rIIOutput, 1, 
+								output, 1 ) ); 
+}

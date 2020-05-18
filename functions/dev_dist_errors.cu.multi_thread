@@ -1,0 +1,53 @@
+
+#include <functions/dev_dist_errors.h>
+
+#include <device/gen_random.h>
+#include <device/device_defines.h>
+#include <device/cuda_utils.h>
+#include <device/handles.h>
+
+#include <core/errors.h>
+
+
+GLOBAL void ker_compute_dist_classes ( real *probs, 
+	int samples, int numClasses, real *distProbs, real *distClasses, int THREADS_PER_SAMPLE )
+{
+	int myRowId;
+	real c = 0; 
+
+	for (int idx = blockDim.x * blockIdx.x + threadIdx.x; 
+				idx / THREADS_PER_SAMPLE < samples; idx += gridDim.x * blockDim.x ) {
+
+		myRowId = idx / THREADS_PER_SAMPLE; 
+
+		if ((idx / THREADS_PER_SAMPLE) == 0) distClasses[ myRowId ] = -1; 
+
+		for (int i = (idx % THREADS_PER_SAMPLE); i < numClasses; i += THREADS_PER_SAMPLE) {
+			c = probs[ myRowId * numClasses + i ]; 
+	
+			if (c >= distProbs[ myRowId ]){
+				distClasses[ idx ] = i + 1; 
+				i += (numClasses + 1); 
+			}
+		}
+
+		if (distClasses[ idx ] == -1) 
+			distClasses[ idx ] = numClasses + 1; 
+	}
+}
+
+
+// numClasses * samples --> columnMajor Order
+void getMultinomialDistSample( real *probs, int samples, int numClasses, 
+   real *distClasses, real *devPtr ) {
+
+	int blocks;
+	getRandomVector( samples, NULL, devPtr, RAND_UNIFORM ); 
+	
+	blocks = ( samples * __THREADS_PER_SAMPLE__ + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+
+	ker_compute_dist_classes <<< blocks, BLOCK_SIZE >>> 
+		( probs, samples, numClasses, devPtr, distClasses, __THREADS_PER_SAMPLE__ ); 
+	cudaDeviceSynchronize (); 
+	cudaCheckError (); 
+}

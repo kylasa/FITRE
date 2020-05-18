@@ -1,0 +1,228 @@
+
+import torch
+import torch.nn as nn
+import torch.autograd as autograd
+from torch.autograd import Variable
+
+
+import numpy as np
+import datetime
+
+class SubsampledTRCGKFACFULL: 
+
+	def __init__ (self, network, linsolver, params, stats, train, test, train_sampler ): 
+		self.network = network
+		self.train = train
+		self.test = test
+		self.params = params
+		self.stats = stats
+		self.linearSolver = linsolver
+		self.train_sampler = train_sampler
+		self.x = None
+
+	def initializeZero( self ): 
+		x = [ torch.zeros( W.numel() ).type( torch.DoubleTensor ) for W in self.network.parameters () ]
+		self.x = torch.cat( x ).cuda ()
+
+	def initializeRandom( self ): 
+		#x = [ torch.rand( W.numel() ).type( torch.DoubleTensor ) for W in self.network.parameters () ]
+		x = [ torch.randn( W.numel() ).type( torch.DoubleTensor ) for W in self.network.parameters () ]
+		self.x = (0.25 * torch.cat( x )).cuda ()
+
+	def initXavier( self ): 
+		self.network.initXavierUniform()
+		self.x = self.network.getWeights ()
+
+	def initKaiming( self ): 
+		self.network.initKaimingUniform()
+		self.x = self.network.getWeights ()
+
+	def getZeroVector (self): 
+		z = [ torch.zeros( W.numel() ).type( torch.DoubleTensor ) for W in self.network.parameters () ]
+		return torch.cat( [ p.contiguous().view(-1) for p in z ] ).cuda ()
+
+	def getRandomVector (self): 
+		r = [ torch.randn( W.numel() ).type( torch.DoubleTensor ) for W in self.network.parameters () ]
+		#r = [ torch.ones( W.numel() ).type( torch.DoubleTensor ) for W in self.network.parameters () ]
+		#r = [ torch.zeros( W.numel() ).type( torch.DoubleTensor ) for W in self.network.parameters () ]
+		return ( torch.cat( [ p.contiguous().view(-1) for p in r ] )).cuda ()
+		#return torch.cat( [ torch.ones( W.numel ()).type( torch.DoubleTensor ) for W in self.network.parameters () ] )
+
+
+	def solve( self ): 
+
+		self.network.setWeights( self.x.cuda () )
+
+		i = 0
+		failures = 0
+		self.network.stopRecording ()
+
+		# store the initial values of Omega and Lambda (KFAC) for 
+		# large sample sizes:  5000
+		large_sample_x, large_sample_y = next(iter( self.train_sampler ) )
+		self.network.initKFACStorage( large_sample_x.shape[0] )
+		self.network.startRecording ()
+		self.network.computeTempsForKFAC ( large_sample_x.cuda () )
+		self.network.computeInitialKFACTerms ( large_sample_x.cuda () )
+		self.network.stopRecording ( )
+
+		self.network.initKFACStorage( self.network.batchSize )
+
+		while (i <= self.params.max_iters): 
+
+			start = datetime.datetime.now ()
+
+			# Make one full pass of the dataset here. 
+			self.fullPass ()
+
+			end = datetime.datetime.now ()
+
+			# Compute Train and Test Accuracy here. 
+			train_ll, tr_accu = self.getStatistics (self.train)
+			test_ll, test_accu = self.getStatistics (self.test)
+					
+			#print stats here.
+			self.stats.train_accu = tr_accu
+			self.stats.test_accu = test_accu
+
+			self.stats.train_ll = train_ll
+			self.stats.test_ll = test_ll
+
+			self.stats.delta = 0
+			self.stats.gradnorm = 0
+
+			self.stats.tr_failures = 0 
+			self.stats.cg_iterations = 0 
+
+			self.stats.iteration_time = ( end - start ).total_seconds ()
+			self.stats.total_time += (end - start ).total_seconds ()
+
+			self.stats.printIterationStats ()
+
+			i += 1
+
+		#cleanup and exit....
+		self.stats.shutdown ()
+
+	def getStatistics (self, dataset): 
+
+		ll = 0
+		accu = 0
+		for x, y in dataset:
+			t, a = self.network.evalModel( x.cuda (), y.cuda ())
+			ll += t
+			accu += a
+		return ll / len( dataset ), accu / len( dataset )
+
+
+	def fullPass( self ): 
+
+		for sampleX, sampleY in self.train: 
+			X_sample_var = sampleX.type(torch.DoubleTensor).cuda ()
+			Y_sample_var = sampleY.cuda ()
+
+			self.network.setWeights( self.x )
+
+			self.network.zero_grad ()
+			tr_ll, grad = self.network.computeGradientIter( X_sample_var, Y_sample_var  )
+
+			#KFAC here. 
+			#compute F{-1} * gradient = approximated natural gradient here. 
+			#convert the vector to structures. 
+			if (len(sampleX) == self.network.batchSize): 
+				self.network.startRecording ()
+				self.network.computeTempsForKFAC ( X_sample_var )
+				self.network.stopRecording ()
+				x_kfac_t = self.network.computeKFACHv( X_sample_var, self.network.unpackWeights( grad ), False)
+			else: 
+				x_kfac_t = self.network.computeKFACHv( X_sample_var, self.network.unpackWeights( grad ), True )
+
+			x_kfac = torch.cat([ w.contiguous().view( -1 ) for w in x_kfac_t ])
+			x_kfac = Variable( x_kfac.type( torch.cuda.DoubleTensor ) )
+
+			#compute the model reduction here. 
+			# m = eta * grad * x_kfac + eta * eta * 0.5 * x_kfac * Hessian * x_kfac
+			vHv = torch.dot( self.network.computeHv( Variable( X_sample_var, requires_grad=True ), Variable( Y_sample_var ), x_kfac.data ), x_kfac )
+
+			#handle Negative Curvature here. 
+			if ( vHv.data[ 0 ] < 0 ): 
+				step = -(self.params.delta) / torch.norm( x_kfac ).data
+				step = Variable( step.cuda () )
+				kfac_step = step
+			else: 
+				gv = torch.dot( x_kfac, Variable( grad ) ).cpu ()
+				step = gv / (vHv.cpu () + 1e-6)
+
+				#import pdb;pdb.set_trace();
+
+				step = - torch.min( step.data, (self.params.delta / (torch.norm(x_kfac).cpu ().data + 1e-16)) )
+				step = Variable( step.cuda () )
+				kfac_step = step
+
+			m_kfac = step * torch.dot( x_kfac, Variable( grad )) + 0.5 * step * step * torch.dot( self.network.computeHv( Variable( X_sample_var, requires_grad=True ), Variable( Y_sample_var ), x_kfac.data ), x_kfac )
+
+			vHv = torch.dot( self.network.computeHv( Variable( X_sample_var, requires_grad=True ), Variable( Y_sample_var ), grad.cuda () ), Variable( grad.cuda () ) )
+			if (vHv.data[ 0 ] < 0 ): 
+				step = -(self.params.delta) / torch.norm( grad ).data
+				step = Variable( step.cuda () )
+				grad_step = step
+			else: 
+				gv = torch.dot( grad, grad )
+				step = gv / (vHv.cpu() + 1e-6)
+				step = - torch.min( step.data, self.params.delta / (torch.norm(x_kfac).cpu().data+ 1e-16) )
+				step = Variable( torch.from_numpy( np.asarray( [ step ] ) ).type( torch.cuda.DoubleTensor) )
+				grad_step = step
+
+			#import pdb;pdb.set_trace();
+
+			m_g_kfac = step * torch.dot( Variable( grad.cuda () ), Variable( grad.cuda () ) ) + 0.5 * step * step * torch.dot( self.network.computeHv( Variable( X_sample_var, requires_grad=True ), Variable( Y_sample_var ), grad.cuda () ), Variable( grad.cuda () ) )
+
+			self.network.zero_grad ()
+			if (m_kfac.data[0] <= m_g_kfac.data[0]): 
+
+				#for X, Y in self.train: 
+				tr_ll, tr_accu = self.network.evalModel( X_sample_var, Y_sample_var )
+				#self.network.updateWeights(  (Variable( torch.from_numpy( np.asarray( [ kfac_step ] ) ) ).type(torch.cuda.DoubleTensor) * x_kfac).data )
+				#import pdb;pdb.set_trace();
+				self.network.updateWeights(  (kfac_step * x_kfac).data )
+
+				#for X, Y in self.train: 
+				self.network.zero_grad ()
+				new_ll, new_accu = self.network.evalModel( X_sample_var, Y_sample_var )
+				self.stats.no_props += len( self.train )
+				rho = (tr_ll - new_ll) / (-m_kfac.data[0])
+
+				if (rho.data[0] > 0.75) : #1e-4 
+					self.x = self.x.add( kfac_step.data * x_kfac.data )
+					self.params.delta = min( self.params.max_delta, self.params.gamma1 * self.params.delta ) # 2
+				elif( rho.data[0] >= 0.25 ): 
+					self.x = self.x.add( kfac_step.data * x_kfac.data )
+				else: 
+					self.params.delta /= self.params.gamma1 # 2
+
+			else: 
+
+				#for X, Y in self.train: 
+				tr_ll, tr_accu = self.network.evalModel( X_sample_var, Y_sample_var )
+				self.network.updateWeights( grad_step.data * grad.cuda () )
+
+				#for X, Y in self.train: 
+				self.network.zero_grad ()
+				new_ll, new_accu = self.network.evalModel( X_sample_var, Y_sample_var )
+				self.stats.no_props += len( self.train )
+				rho = (tr_ll - new_ll) / (-m_g_kfac.data[0])
+
+				if (rho.data[0] > 0.75) : #1e-4 
+					self.x = self.x.add( grad_step.data * grad.cuda () )
+					self.params.delta = min( self.params.max_delta, self.params.gamma1 * self.params.delta ) # 2
+				elif( rho.data[0] >= 0.25 ): 
+					self.x = self.x.add( grad_step.data * grad.cuda () )
+				else: 
+					self.params.delta /= self.params.gamma1 # 2
+
+			X_sample_var.volatile = True
+			Y_sample_var.volatile = True
+			x_kfac.volatile = True
+			kfac_step.volatile = True
+			grad_step.volatile = True
+

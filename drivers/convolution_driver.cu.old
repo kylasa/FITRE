@@ -1,0 +1,238 @@
+
+#include <drivers/convolution_driver.h>
+
+#include <core/errors.h>
+
+#include <device/cuda_utils.h>
+#include <device/device_defines.h>
+#include <device/handles.h>
+
+#include <functions/dev_initializations.h>
+#include <functions/eval_convolution.h>
+
+#include <utilities/print_utils.h>
+#include <utilities/utils.h>
+
+
+#include <limits.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <float.h>
+
+#define HEIGHT 3
+#define WIDTH 3
+#define CHANNELS 3
+
+#define OUT_CHANNELS 6
+#define KERNEL 2
+#define POOL_KERNEL 2
+#define POINTS 1
+
+#define OUT_HEIGHT 2
+#define OUT_WIDTH 2
+
+#define POOL_HEIGHT 2
+#define POOL_WIDTH 2
+
+#define PADDING 0
+#define STRIDE 1
+
+void printImg(real *dev, real *host, int size )
+{
+	copy_host_device( host, dev, size * sizeof(real), 
+		cudaMemcpyDeviceToHost, ERROR_MEMCPY_HOST_DEVICE ); 
+	
+	fprintf( stderr, "img.... \n\n"); 
+	for (int p = 0; p < 1; p ++) {
+	for (int c = 0; c < CHANNELS; c ++){
+	for (int i = 0; i < HEIGHT; i ++){
+		for (int j = 0; j < WIDTH; j ++){
+			fprintf( stderr, "%3d ", (int)host[ j * HEIGHT + i + c * HEIGHT * WIDTH ] ); 
+		}
+		fprintf( stderr, "\n"); 
+	}
+	fprintf( stderr, "====\n"); 
+	}
+	}
+	fprintf( stderr, "\n\n"); 
+}
+
+void printImgCol (real *dev, real *host, int size)
+{
+	copy_host_device( host, dev, size * sizeof(real), 
+		cudaMemcpyDeviceToHost, ERROR_MEMCPY_HOST_DEVICE ); 
+
+	fprintf( stderr, "Printing ImgCols output... \n\n"); 
+	//for (int i = 0; i < KERNEL * KERNEL; i ++) fprintf( stderr, "%3d ", (int) host[ i * KERNEL * KERNEL ] ); 
+	//fprintf( stderr, "\n"); 
+	//for (int i = 0; i < KERNEL * KERNEL; i ++) fprintf( stderr, "%3d ", (int) host[ i * KERNEL * KERNEL + 1 ] ); 
+
+	for (int j = 0; j < OUT_HEIGHT * OUT_WIDTH; j ++ ) {
+		for (int i = 0; i < KERNEL * KERNEL * CHANNELS; i ++) {
+			fprintf( stderr, "%4.2f", host[ i * OUT_HEIGHT * OUT_WIDTH + j ] ); 	
+		}
+		fprintf( stderr, "\n"); 
+	}
+	fprintf( stderr, "\n"); 
+
+	/*
+	for (int i = 0; i < OUT_HEIGHT * OUT_WIDTH * KERNEL * KERNEL * CHANNELS; i ++ )
+		fprintf( stderr, " %3d", (int) host[ i ] ); 
+	fprintf( stderr, "\n"); 
+	fprintf( stderr, "\n"); 
+	*/
+}
+
+void printImgColWeights( real *dev, real *host, int size)
+{
+	copy_host_device( host, dev, size * sizeof(real), 
+		cudaMemcpyDeviceToHost, ERROR_MEMCPY_HOST_DEVICE ); 
+
+	fprintf( stderr, "img.... \n\n"); 
+	for (int c = 0; c < OUT_CHANNELS; c ++) {
+		for (int j = 0; j < OUT_HEIGHT; j ++){
+			for (int i = 0; i < OUT_WIDTH; i ++){
+			fprintf( stderr, "%6.2f ", host[ j * OUT_HEIGHT + i + c * OUT_HEIGHT * OUT_WIDTH ] ); 
+			}
+			fprintf( stderr, "\n"); 
+		}
+		fprintf( stderr, "--------------\n"); 
+	}
+	fprintf( stderr, "\n\n"); 
+
+	
+	for (int i = 0; i < OUT_CHANNELS * OUT_HEIGHT * OUT_WIDTH; i ++) 
+		fprintf( stderr, "%6.2f",  host[ i ] ); 
+	fprintf( stderr, "\n\n"); 
+	
+}
+
+void printPool( real *dev, real *host, int size )
+{
+	copy_host_device( host, dev, size * sizeof(real), 
+		cudaMemcpyDeviceToHost, ERROR_MEMCPY_HOST_DEVICE ); 
+
+	fprintf( stderr, "img.... \n\n"); 
+	for (int c = 0; c < size; c ++){
+		fprintf( stderr, "%4.2f ", host[ c ] ); 
+	}
+	fprintf( stderr, "\n\n"); 
+}
+
+void initDataset( DEVICE_DATASET *data, SCRATCH_AREA *scratch, 
+	int h, int w, int ch, int k, int out_ch )
+{
+	int height_col = ( h - k ) + 1; 
+	int width_col = ( w - k ) + 1; 
+	int points = POINTS; 
+
+	real *host = scratch->hostWorkspace; 
+	real *dev = scratch->devWorkspace; 
+
+	for (int p = 0; p < points; p ++) {
+	for (int i = 0; i < ch; i ++){
+		for (int r = 0; r < h; r ++) {
+			for (int c = 0; c < w; c ++) { 
+				host[ i * h * w + h * c + r ] = (i + 1) * 10 + w * c + r; 
+			} 
+		}
+	}
+	}
+
+	cuda_malloc( (void **)&data->trainSetX, sizeof(real) * ch * h * w * points, 0, 
+				ERROR_MEM_ALLOC ); 
+
+	copy_host_device( host, data->trainSetX, sizeof(real) * ch * h * w * points, 
+			cudaMemcpyHostToDevice, ERROR_MEMCPY_HOST_DEVICE ); 
+
+	data->trainSizeX = points; 
+}
+
+void initWeights( real *weights, int ch, int k, int out_ch, 
+	real *host )
+{
+	for (int c = 0; c < out_ch; c ++ ){
+		for (int i = 0; i < ch * k * k; i ++) {
+			host[ c * ch * k * k + i ] = (c+1) * 0.001;
+		}
+	}	
+
+	copy_host_device( host, weights, sizeof(real) * ch * k * k * out_ch, 
+			cudaMemcpyHostToDevice, ERROR_MEMCPY_HOST_DEVICE ); 
+
+	for (int i = 0; i < out_ch; i ++) 
+		host[ i ] = (i+1); 
+
+	copy_host_device( host, weights + ch * k * k * out_ch, sizeof(real) * out_ch, 
+			cudaMemcpyHostToDevice, ERROR_MEMCPY_HOST_DEVICE ); 
+}
+
+void printWeights( real *weights, int size, real *host )
+{
+	copy_host_device( host, weights, sizeof(real) * (size + OUT_CHANNELS), 
+			cudaMemcpyDeviceToHost, ERROR_MEMCPY_HOST_DEVICE ); 
+
+	for (int i = 0; i < size; i ++ )
+		fprintf( stderr, "%6f", host[ i ] ); 
+	fprintf( stderr, "\n\n" ); 
+
+	fprintf( stderr, " BIAS---> \n" ); 
+	for (int i = 0; i < OUT_CHANNELS; i ++)
+		fprintf( stderr, "%6f ", *(host+ size + i));
+
+	fprintf( stderr, "\n\n" ); 
+}
+
+void testConvolution( CNN_MODEL *model, DEVICE_DATASET *data, 
+	SCRATCH_AREA *scratch )
+{
+
+	real start, total; 
+
+	fprintf( stderr, "Test case begin... \n"); 
+
+	cuda_malloc( (void **)&data->weights, sizeof(real) * OUT_CHANNELS * HEIGHT * WIDTH * CHANNELS, 0, 
+				ERROR_MEM_ALLOC ); 
+
+
+	//init weights here. 
+	initWeights( data->weights, CHANNELS, KERNEL, OUT_CHANNELS, scratch->hostWorkspace ); 
+
+	//init Dataset here. 
+	initDataset( data, scratch, HEIGHT, WIDTH, CHANNELS, KERNEL, OUT_CHANNELS ); 	
+	printImg( data->trainSetX, scratch->hostWorkspace, POINTS * CHANNELS * HEIGHT * WIDTH ); 
+
+	cuda_memset( scratch->devWorkspace, 0, sizeof(real) * OUT_WIDTH * OUT_HEIGHT * KERNEL * KERNEL * CHANNELS, ERROR_MEMSET ); 
+	printImgCol( scratch->devWorkspace, scratch->hostWorkspace, OUT_HEIGHT * OUT_WIDTH * KERNEL * KERNEL * CHANNELS ); 
+
+	//start timer
+	start = Get_Time ();
+
+	testImgConv( data->trainSetX, CHANNELS, 
+		HEIGHT, WIDTH, KERNEL, PADDING, STRIDE, OUT_CHANNELS, AVG_POOL, 
+		data->weights, data->weights + OUT_CHANNELS * CHANNELS * KERNEL * KERNEL, 
+		POINTS, scratch->devWorkspace ); 
+
+	//end timer
+	total = Get_Timing_Info( start );
+
+	fprintf( stderr, "Total time in msecs for convolution layer for batch: %d is: %2.6f\n", 
+			POINTS, total * 1000.); 
+
+	fprintf( stderr, "ImgCols.... \n"); 
+	printImgCol( scratch->devWorkspace, scratch->hostWorkspace, OUT_HEIGHT * OUT_WIDTH * KERNEL * KERNEL * CHANNELS ); 
+
+	fprintf( stderr, "weights.... \n"); 
+	printWeights( data->weights, KERNEL * KERNEL * CHANNELS * OUT_CHANNELS, scratch->hostWorkspace ); 
+
+	fprintf( stderr, "ImgColWeights.... \n"); 
+	printImgColWeights( scratch->devWorkspace + OUT_HEIGHT * OUT_WIDTH * KERNEL * KERNEL * CHANNELS, 
+			scratch->hostWorkspace, OUT_HEIGHT * OUT_WIDTH * OUT_CHANNELS ); 
+
+	fprintf( stderr, "Pool.... \n"); 
+	printPool( scratch->devWorkspace + OUT_HEIGHT * OUT_WIDTH * KERNEL * KERNEL * CHANNELS  + 
+			OUT_HEIGHT * OUT_WIDTH * OUT_CHANNELS, 
+			scratch->hostWorkspace, OUT_CHANNELS ); 
+
+	fprintf( stderr, "Test case end... \n"); 
+}

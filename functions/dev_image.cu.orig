@@ -1,0 +1,274 @@
+
+#include <functions/dev_image.h>
+
+#include <device/device_defines.h>
+#include <device/cuda_utils.h>
+#include <device/handles.h>
+
+//here the mapping is from destination(col) to source( image )
+//one thread per source image... 
+GLOBAL void ker_col2img( const int n, const real* data_col, 
+	const int height, const int width, const int channels, const int ksize, 
+	const int pad, const int stride, const int height_col, const int width_col, 
+	real* data_im )
+{
+	for (int index = threadIdx.x + blockDim.x * blockIdx.x; 
+			index < n; index += blockDim.x * gridDim.x )
+	{
+		real value = 0; 
+		//assumes source as the row major order image. 
+		int w = index % width + pad; 					//source width
+		int h = (index / width) % height + pad; 	// source height
+		int c = index / (width * height); 			//source channel
+
+		//col limits here. 
+		int w_col_start = (w < ksize) ? 0 : (w - ksize)/stride + 1; 
+		int w_col_end = min( w / stride + 1, width_col ); 
+		int h_col_start = (h < ksize) ? 0 : (h - ksize)/stride + 1; 
+		int h_col_end = min( h / stride + 1, height_col); 
+
+		// build the image from the column format here. 
+		int offset = (c * ksize * ksize + h * ksize + w) * height_col * width_col; 
+		int coeff_h_col = (1 - stride * ksize * height_col) * width_col; 
+		int coeff_w_col = (1 - stride * height_col * width_col); 
+
+		for (int h_col = h_col_start; h_col < h_col_end; ++h_col){
+			for (int w_col = w_col_start; w_col < w_col_end; ++w_col) { 
+				value += data_col[ offset + h_col * coeff_h_col + w_col * coeff_w_col ]; 
+			}
+		}
+		data_im[ index ] = value; 
+	}
+}
+
+GLOBAL void ker_batch_col2img( const int n, const real* data_col, 
+	const int height, const int width, const int channels, const int ksize, 
+	const int pad, const int stride, const int height_col, const int width_col, 
+	real* data_im )
+{
+	int imgIdx = blockIdx.y; 
+	int imgOffset = imgIdx * height * width * channels; 
+	int colOffset = imgIdx * channels * ksize * ksize * height_col * width_col; 
+
+	for (int index = threadIdx.x + blockDim.x * blockIdx.x; 
+			index < n; index += blockDim.x * gridDim.x )
+	{
+		real value = 0; 
+		//assumes source as the row major order image. 
+		int w = index % width + pad; 					//source width
+		int h = (index / width) % height + pad; 	// source height
+		int c = index / (width * height); 			//source channel
+
+		//col limits here. 
+		int w_col_start = (w < ksize) ? 0 : (w - ksize)/stride + 1; 
+		int w_col_end = min( w / stride + 1, width_col ); 
+		int h_col_start = (h < ksize) ? 0 : (h - ksize)/stride + 1; 
+		int h_col_end = min( h / stride + 1, height_col); 
+
+		// build the image from the column format here. 
+		int offset = (c * ksize * ksize + h * ksize + w) * height_col * width_col; 
+		int coeff_h_col = (1 - stride * ksize * height_col) * width_col; 
+		int coeff_w_col = (1 - stride * height_col * width_col); 
+
+		for (int h_col = h_col_start; h_col < h_col_end; ++h_col){
+			for (int w_col = w_col_start; w_col < w_col_end; ++w_col) { 
+				value += data_col[ offset + h_col * coeff_h_col + w_col * coeff_w_col + colOffset ]; 
+			}
+		}
+		data_im[ index + imgOffset ] = value; 
+	}
+}
+
+// processing one col to img conversion here. 
+void getImageFromCols( const real* data_col, const int channels, 
+	const int height, const int width, const int ksize, const int pad, 
+	const int stride, real* data_im) {
+
+	int height_col = (height + 2 * pad - ksize)/stride + 1; 
+	int width_col = (width + 2 * pad - ksize)/stride + 1; 
+	int num_kernels = channels * height *width; // no of. threads = no. of pixels in img.
+
+	int blocks = (num_kernels + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+	ker_col2img <<< blocks, BLOCK_SIZE >>> 
+		( num_kernels, data_col, height, width, channels, ksize, pad, stride, 
+			height_col, width_col, data_im ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+}
+
+void getBatchImagesFromCols( const real* data_col, const int channels, 
+	const int height, const int width, const int ksize, const int pad, 
+	const int stride, real* data_im, int samples) {
+
+	int height_col = (height + 2 * pad - ksize)/stride + 1; 
+	int width_col = (width + 2 * pad - ksize)/stride + 1; 
+	int num_kernels = channels * height *width; // no of. threads = no. of pixels in img.
+
+	int x_blocks = (num_kernels + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+	int y_blocks = samples; 
+	dim3 gridDef( 1, y_blocks, x_blocks ); 
+	ker_col2img <<< gridDef, BLOCK_SIZE >>> 
+		( num_kernels, data_col, height, width, channels, ksize, pad, stride, 
+			height_col, width_col, data_im ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+}
+
+
+//image -> col conversion for single image. 
+// A simple and efficient implementation of im2col
+// for CNN - paper. 
+
+//one thread per source image pixel. -- managed in one grid. 
+// grid count indicates the number of images processed. 
+GLOBAL void ker_batch_im2col( const int n, const real* input, const int channels, 
+	const int height, const int width, const int ksize, const int pad, 
+	const int stride, const int height_col, const int width_col, 
+	real* output, const int numImages )
+{
+	int myIdx = blockIdx.x * blockDim.x + threadIdx.x; 
+	int sampleId = blockIdx.y; 
+	size_t outOffset = channels * width_col  * height_col * sampleId; 
+	size_t inOffset = channels * height * width * sampleId;
+
+	for (int index = myIdx; index < n; index += blockDim.x * gridDim.x)
+	{
+		int h_out = index % height_col; 		//column number
+		int h_index = index / height_col; 	// no. of columns
+		int w_out = h_index % width_col; 	
+		int channel_in = h_index / width_col; 
+		int channel_out = channel_in * ksize * ksize; 
+		int h_in = h_out * stride - pad; 
+		int w_in = w_out * stride - pad; 
+
+		real* data_out = output; 
+		data_out += (( channel_out * width_col + w_out ) * height_col + h_out) + outOffset; 
+
+		const real* data_in = input; 
+		data_in += ((channel_in * width + w_in ) * height + h_in) + inOffset ; 
+
+		for (int j = 0; j < ksize; j ++) {
+			for (int i = 0; i < ksize; i ++){
+				int h = h_in + i; 
+				int w = w_in + j; 
+
+				*data_out = (h >= 0 && w >= 0 && h < height && w < width ) ? 
+					data_in[ j * height + i ] : 0; 
+				data_out += height_col * width_col; 
+			}
+		}
+	}
+}
+
+// one thread per source image pixel.
+GLOBAL void ker_im2col( const int n, const real* data_im, 
+	const int height, const int width, const int ksize, const int pad, 
+	const int stride, const int height_col, const int width_col, real *data_col )
+{
+	for (int index = blockIdx.x * blockDim.x + threadIdx.x; 
+			index < n; index += blockDim.x * gridDim.x ){
+		
+		int h_out = index % height_col; 
+		int h_index = index / height_col; 
+		int w_out = h_index % width_col; 
+		int channel_in = h_index / width_col; 
+		int channel_out = channel_in * ksize * ksize; 
+		int h_in = h_out * stride - pad; 
+		int w_in = w_out * stride - pad; 
+
+		//output pointer
+		real* data_col_ptr = data_col; 
+		//data_col_ptr += ( channel_out * height_col + h_out ) * width_col + w_out; 
+		data_col_ptr += ( channel_out * width_col + w_out ) * height_col + h_out; 
+
+		//input pointer.
+		const real* data_im_ptr = data_im; 
+		data_im_ptr += (channel_in * width + w_in) * height+ h_in; 
+
+		for (int j = 0; j < ksize; j ++){
+			for (int i = 0; i < ksize; i ++) {
+				int h = h_in + i; 
+				int w = w_in + j; 
+
+				*data_col_ptr = ((h >= 0) && (w >= 0) && (h < height) && (w < width )) ? 
+					//Row Major ordering
+					//data_im_ptr[ i * width + j ] : 0; 
+				//data_col_ptr += height_col * width_col; 
+
+					//Column Major ordering
+					data_im_ptr[ j * height + i ] : 0; 
+				data_col_ptr += height_col * width_col;
+			}
+		}
+	}
+}
+
+void getImageCols( real* data_im, const int channels, const int height, const int width, 
+						const int ksize, const int pad, const int stride, real* data_col) 
+{
+	int height_col = (height + 2 * pad - ksize ) / stride + 1; 
+	int width_col = (width + 2 * pad - ksize ) / stride + 1; 
+
+	int num_kernels = channels * height_col * width_col; 
+	int blocks = (num_kernels + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+
+	//one thread per element kernel.
+	ker_im2col <<<blocks, BLOCK_SIZE>>> 
+		( num_kernels, data_im, height, width, ksize, pad, stride, height_col, width_col, data_col ); 
+	//ker_im2col <<<1, 28*28>>> 
+	//	( 28*28, data_im, 32, 32, 5, 0, 1, 28, 28, data_col ); 
+	cudaThreadSynchronize ();
+	cudaCheckError (); 
+}
+
+void getBatchImageCols( real* data_in, int samples, 
+	const int channels, const int height, const int width, 
+	const int ksize, const int pad, const int stride, real *data_col )
+{
+	int height_col = (height + 2 * pad - ksize ) / stride + 1; 
+	int width_col = (width + 2 * pad - ksize ) / stride + 1; 
+
+	int num_kernels = channels * height_col * width_col; 
+	int x_blocks = (num_kernels + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+	int y_blocks = samples;
+	dim3 blocks(1, y_blocks, x_blocks ); 
+	
+	//One thread per source image pixel
+	//no. of grids = batch size... 
+	ker_batch_im2col <<< blocks, BLOCK_SIZE >>> 
+		( num_kernels, data_in, channels, height, width, ksize, pad, stride, 
+			height_col, width_col, data_col, samples ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+}
+
+/*
+
+//One thread per pixel shared across all the channels.
+GLOBAL void ker_merge_col_weights ( real *input, int rows, int cols, int channels, int n, 
+	real *bias )
+{
+	int myIdx = threadIdx.x + blockDim.x * blockIdx.x; 
+	int imgId = blockIdx.y; 
+		
+	int myRow = myIdx % rows; 
+	int myCol = myIdx / cols; 
+
+	if (myIdx < n) {
+		for (int i = 1; i < channels; i ++)
+			input[ myRow + myCol * rows + imgId * rows * cols ] += input[ myRow + myCol * rows * i + imgId * rows * cols ]; 	
+	}
+}
+
+void mergeColWeights( real *input, int rows, int cols, int channels, int samples, real *bias )
+{
+	int x_blocks = (rows * cols + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+	dim3 blocks( 1, samples, x_blocks ); 
+
+	ker_merge_col_weights <<< blocks, BLOCK_SIZE >>> 
+		( input, rows, cols, channels, x_blocks, bias ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+}
+
+*/

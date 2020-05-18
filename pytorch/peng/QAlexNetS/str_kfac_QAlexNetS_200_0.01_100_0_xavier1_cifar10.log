@@ -1,0 +1,1 @@
+2019-01-17 18:40:08,080 Namespace(batch_size=200, check_grad=False, cuda=True, da=0, damp=0.01, decay_epoch=[99, 199, 299], epochs=10, init='xavier', log='QAlexNetS/str_kfac_QAlexNetS_200_0.01_100_0_xavier1_cifar10.log', log_interval=1, max_delta=100, model='QAlexNetS', no_cuda=False, resume=0, save=0, seed=1, test_batch_size=1000, weight=0)

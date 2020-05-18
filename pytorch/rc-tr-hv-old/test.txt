@@ -1,0 +1,1 @@
+Tr.LL	Tr.Accu	Test.LL	Test.Acc	grad.norm	delta		No.Fails	CG.Iters	Iter.Time	Total.Time

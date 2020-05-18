@@ -1,0 +1,30 @@
+
+#include <device/warpsum.h>
+#include <device/reduce.h>
+#include <device/device_defines.h>
+
+GLOBAL void reduce(const real *input, real *results, const size_t count) {
+	extern __shared__ real warp_results[];
+	unsigned int lane = threadIdx.x >> 5;
+	unsigned int idx =  blockDim.x * blockIdx.x + threadIdx.x;
+
+	real sdata;
+	real x = 0;
+	warp_results[ lane ] = 0;
+	sdata = 0;
+
+	for (; idx < gridDim.x * blockDim.x; idx += gridDim.x * blockDim.x ) {
+		x = 0; 
+		if(idx < count) x = input [idx];
+		sdata = x;
+		sdata = warpSum ( sdata );
+		if (threadIdx.x % WARP_SIZE == 0) warp_results[lane] += sdata;
+		__syncthreads ();
+	}
+
+	if (lane == 0) { 
+		sdata = warp_results[ threadIdx.x ];
+		sdata = warpSum( sdata );
+		if(threadIdx.x == 0) results [ blockIdx.x  ] =  sdata;
+	}
+}

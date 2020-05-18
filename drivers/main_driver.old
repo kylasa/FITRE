@@ -1,0 +1,79 @@
+
+#include <device/query.h>
+#include <device/cuda_environment.h>
+#include <functions/eval_gradient.h>
+#include <core/datadefs.h>
+
+#include <drivers/dataset_driver.h> 
+#include <utilities/print_utils.h>
+#include <utilities/utils.h>
+
+#include <nn/read_nn.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <time.h>
+
+cublasHandle_t cublasHandle; 
+cusparseHandle_t cusparseHandle;
+
+int BLOCK_SIZE; 
+int WARP_SIZE; 
+int DEVICE_NUM_BLOCKS;
+
+int main( int argc, char **argv )
+{
+	NN_MODEL curvesModel; 
+	HOST_DATASET hostData; 
+	DEVICE_DATASET deviceData;
+	SCRATCH_AREA scratch;
+
+	real start, total;
+
+	//DEVICE initialization
+	cuda_env_init( &scratch, 0 ); 
+	getDeviceParameters ();
+
+	//Dataset initialization
+	testDatasetRead (&curvesModel, &hostData, &deviceData);
+
+	//init the model here. 
+	readNeuralNet (&curvesModel, hostData.features, hostData.features, hostData.trainSizeX ); 
+
+	//auto-encoder initialization here. 
+	autoencoderInitializations( &curvesModel, &deviceData ); 
+
+	//Forward Pass
+	/*
+	real *logLikelihood = scratch.pageLckWorkspace;
+	real *modelError = logLikelihood + 1;
+	evaluateModel( &curvesModel, &deviceData, 
+						logLikelihood, modelError, 
+						scratch.hostWorkspace, scratch.devWorkspace ); 
+
+	fprintf( stderr, "ModelEvaluation Done... \n"
+						"\t\t LogLikelihood = %f \n"
+						"\t\t ModelError = %f \n", *logLikelihood, *modelError ); 
+	*/
+
+	//Gradient Test
+	BLOCK_SIZE = 1024;
+	for (int j = 0; j < 2; j ++){
+		start = Get_Time ();
+		for (int i = 0; i < 10; i ++ ){
+			computeGradient( &curvesModel, NULL, &deviceData, &scratch ); 
+			fprintf( stderr, "." ); 
+		}
+		total = Get_Timing_Info( start ); 
+		fprintf( stderr, " \nEach call to the gradient took ---- %f, for BLOCK_SIZE: %d \n\n\n", (total * 1000.)/10., BLOCK_SIZE ); 
+		BLOCK_SIZE *= 2;
+	}
+	
+	//printVector( scratch.devWorkspace + curvesModel.weightsSize, 100, NULL, scratch.hostWorkspace);
+
+	/*
+	//validate the gradient here. 
+	validateGradient (gradient);
+	*/
+}

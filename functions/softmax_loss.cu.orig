@@ -1,0 +1,292 @@
+#include "softmax_multiclass.h"
+
+#include <utilities/reduce.h>
+
+GLOBAL void ker_exp( real *results, int count)
+{
+	int idx = blockDim.x * blockIdx.x + threadIdx.x; 
+	if (idx < count)
+		results[idx] = exp( (real)idx );
+}
+
+
+GLOBAL void ker_add_regularizer ( real *input, real *vector, real lambda, int count, real normalizer)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+	if (idx < count) input[ idx ] += lambda * vector[ idx ] ;
+}
+
+
+GLOBAL void reduce_vector_warp( const real *input, const real *maxdots, 
+				real *results, const size_t numcomps, int numblocks )
+{
+	extern __shared__ real my_results[]; 
+
+	unsigned int lane  = threadIdx.x >> 5; 
+	unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x; 
+
+	real sdata; 
+   sdata = 0.;
+
+	if (idx < numcomps ){
+		for (int c = 0; c < numblocks; c ++) sdata += input [ c * numcomps + idx ]; 
+		results[ idx ] = sdata ;
+	}
+}
+
+
+GLOBAL void reduce_vector(const real *input, real *results, 
+			const size_t numclasses, const size_t cols, const real normalizer, int numblocks)
+{
+        extern __shared__ real my_results[];
+        unsigned int lane = threadIdx.x >> 5;
+        unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
+
+        real sdata;
+        real x = 0.;
+
+	for (int i = 0; i < numclasses * cols; i ++){
+        	sdata = 0.;
+        	my_results[ lane ] = 0.;
+		x = 0.0;
+		if (idx < numblocks) x = input[idx * numclasses * cols + i];
+        	sdata = x;
+		__syncthreads ();
+
+        	sdata = warpSum ( sdata );
+        	if (threadIdx.x % WARP_SIZE == 0) my_results[lane] = sdata;
+        	__syncthreads ();
+
+        	if (blockDim.x/WARP_SIZE == 0)
+        		sdata = (threadIdx.x < 1) ? my_results[threadIdx.x] : 0;
+        	else
+        		sdata = (threadIdx.x < (blockDim.x/WARP_SIZE)) ? my_results[threadIdx.x] : 0;
+        	__syncthreads ();
+
+        	if (lane == 0) sdata = warpSum( sdata );
+        	if(threadIdx.x == 0) results [ i ] =  sdata * normalizer;
+        	__syncthreads ();
+	}
+}
+
+GLOBAL void reduce_log(const real *input, real *results, const size_t count) {
+        extern __shared__ real my_results[];
+        unsigned int lane = threadIdx.x >> 5;
+        unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
+
+        real sdata;
+        real x = 0;
+
+        sdata = 0;
+        my_results[ lane ] = 0;
+        if(idx < count) x = log(input [idx] );
+        sdata = x;
+
+        sdata = warpSum ( sdata );
+        if (threadIdx.x % WARP_SIZE == 0) my_results[lane] = sdata;
+        __syncthreads ();
+
+        sdata = (threadIdx.x < (blockDim.x/WARP_SIZE)) ? my_results[threadIdx.x] : 0;
+        __syncthreads ();
+
+        if (lane == 0) sdata = warpSum( sdata );
+        if(threadIdx.x == 0) results [ blockIdx.x  ] =  sdata;
+}
+
+GLOBAL void ker_compute_expsum( real *XW, int rows, int cols, int numclasses, 
+			real *expSumVec, int threads_per_col)
+{
+	int myColId = ( blockIdx.x * blockDim.x + threadIdx.x ) % threads_per_col; 	
+	int myRowId = ( blockIdx.x * blockDim.x + threadIdx.x ) / threads_per_col; 	
+	
+	//local Data. 
+	real sdata = 0; 
+	
+	for (int i = myRowId; i < rows; i += gridDim.x * blockDim.x )
+	{
+		sdata = 0; 
+	
+		for (int j = myColId; j < cols; j ++ ) sdata += exp ( XW[ j * rows + i ] ); 
+
+		//warp sum here. 
+        	for (int offset = threads_per_col/2; offset > 0; offset /= 2) 
+			sdata += my_shfl( sdata, offset);
+
+		if (myColId == 0) expSumVec[ i ] = sdata; 
+	}
+}
+
+GLOBAL void ker_compute_fx (real *matvec, int rows, int numclasses, 
+				real *target, real *indicatorVal, real *maxdots )
+{
+	extern __shared__ real my_results[];
+
+	int idx =  blockIdx.x * blockDim.x + threadIdx.x; 
+	int myClrId = idx ;
+	int myRowId = idx ;
+        unsigned int lane = threadIdx.x >> 5;
+
+	real sdata = 0; 
+	real maxdot = 0; 
+	
+	for (int r = myRowId; r < rows; r += gridDim.x * blockDim.x ) {
+		maxdot = 0; 
+		 for (int i = myClrId; i < numclasses; i += 1){
+			if (maxdot < matvec[ i * rows + r ]) maxdot = matvec[ i * rows + r]; 
+	 	 }
+
+		maxdots[ r ] = maxdot; 
+
+		 for (int i = myClrId; i < numclasses; i += 1){
+			if ((int)target[ r ] == (i + 1)) sdata += matvec[ i * rows + r ]; 
+			matvec[ i * rows + r ] = exp( matvec[ i * rows + r ]  - maxdot); 
+		 } 
+	}
+	__syncthreads (); 
+
+	//indicator vals here. 
+   sdata = warpSum ( sdata );
+   if (threadIdx.x % WARP_SIZE == 0) my_results[lane] = sdata ;
+   __syncthreads ();
+
+   sdata = (threadIdx.x < (blockDim.x/WARP_SIZE)) ? my_results[threadIdx.x] : 0;
+   __syncthreads ();
+
+   if (lane == 0) sdata = warpSum( sdata );
+   if(threadIdx.x == 0) indicatorVal [ blockIdx.x  ] =  sdata;
+}
+
+
+real computeCrossEntropyLoss(real *output, real *target, 
+			int rows, int num_classes, 
+			real *devPtr, real *pageLckPtr){
+	
+	real *indicatorVal = devPtr + rows * num_classes; 
+	real *maxdots = indicatorVal + rows + BLOCKS_POW_2; 
+	real *alphax = maxdots + rows + BLOCKS_POW_2; 
+
+	//scratch..
+	real *nextDevPtr = alphax + rows + BLOCKS_POW_2; 
+
+	ker_compute_fx <<< BLOCKS , BLOCK_SIZE, WARP_SIZE * sizeof(real)  >>> 
+			( output, rows, num_classes, target, indicatorVal, maxdots); 
+	cudaThreadSynchronize ();  
+	cudaCheckError (); 
+
+	//reduce the maxdots here. 
+	reduce( maxdots, rows, &pageLckPtr[3], nextDevPtr ); 
+	
+	// final value of the indicator
+	reduce( indicatorVal, BLOCKS, &pageLckPtr[0], nextDevPtr ); 
+
+	//compute the log part here. 
+	int warp_blocks = ((rows * WARP_SIZE) / BLOCK_SIZE) + 
+				(((rows * WARP_SIZE) % BLOCK_SIZE == 0) ? 0 : 1); 
+
+	reduce_vector_warp <<< BLOCKS, BLOCK_SIZE >>> 
+		(devPtr, maxdots, alphax, rows, num_classes ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+	
+	//final log part here. 
+	reduce_log <<< BLOCKS, BLOCK_SIZE, WARP_SIZE* sizeof(real) >>> 
+		( alphax, alphax + rows, rows ); 
+	cudaThreadSynchronize ();
+	cudaCheckError ();
+
+	reduce( alphax + rows, BLOCKS, &pageLckPtr[1], nextDevPtr ); 
+
+	return (pageLckPtr[3] + pageLckPtr[1]) - pageLckPtr[0];
+}
+
+GLOBAL void ker_compute_exp (real *matvec, int rows, int numclasses, 
+				real *target, real *maxdots )
+{
+	extern __shared__ real my_results[];
+
+	int idx =  blockIdx.x * blockDim.x + threadIdx.x; 
+	int myClrId = idx ;
+	int myRowId = idx ;
+
+	real sdata = 0; 
+	real maxdot = 0; 
+	
+	for (int r = myRowId; r < rows; r += gridDim.x * blockDim.x ) {
+		 maxdot = 0; 
+		 for (int i = myClrId; i < numclasses; i += 1){
+			if (maxdot < matvec[ i * rows + r ]) maxdot = matvec[ i * rows + r]; 
+	 	 }
+
+		 maxdots[ r ] = maxdot; 
+
+		 for (int i = myClrId; i < numclasses; i += 1){
+			if ((int)target[ r ] == (i + 1)) sdata += matvec[ i * rows + r ]; 
+			matvec[ i * rows + r ] = exp( matvec[ i * rows + r ]  - maxdot); 
+		 } 
+	}
+}
+
+GLOBAL void ker_compute_probs( const real *input, 
+		const size_t rows, int cols)
+{
+	unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x; 
+
+	real sdata; 
+   sdata = 0.;
+
+	if (idx < rows){
+		for (int c = 0; c < cols; c ++) sdata += input [ c * rows + idx ]; 
+		for (int c = 0; c < cols; c ++) input [ c * rows + idx ] = input[ c * rows + idx ] / sdata; 
+	}
+}
+
+GLOBAL void ker_compute_ll (real *matvec, int rows, int numclasses, 
+				real *target, real *indicators)
+{
+	extern __shared__ real my_results[];
+
+	int idx =  blockIdx.x * blockDim.x + threadIdx.x; 
+	int myClrId = idx ;
+	int myRowId = idx ;
+
+	real sdata = 0; 
+	real maxdot = 0; 
+	
+	for (int r = myRowId; r < rows; r += gridDim.x * blockDim.x ) {
+
+		 for (int i = myClrId; i < numclasses; i += 1){
+			if ((int)target[ r ] == (i + 1)) sdata = matvec[ i * rows + r ]; 
+			indicators[ r ] = - sdata; 
+		 } 
+	}
+}
+
+
+real computeProbsAndCrossEntropyLoss( real *input, real *target, 
+	int rows, int num_classes, 
+	real *probs, real *devPtr, real *pageLckPtr ){
+
+	
+	//maxDots, numerators
+	ker_compute_exp <<< BLOCKS , BLOCK_SIZE, WARP_SIZE * sizeof(real)  >>> 
+			( input, rows, num_classes, target, maxdots); 
+	cudaThreadSynchronize ();  
+	cudaCheckError (); 
+
+	//Probabilities... 
+	ker_compute_probs <<< BLOCKS, BLOCK_SIZE, WARP_SIZE * sizeof(real) >>> 
+		(input, rows, num_classes);
+	cudaThreadSynchronize ();  
+	cudaCheckError (); 
+	
+	//Log Likelihoods here. 
+	ker_compute_ll <<< BLOCKS, BLOCK_SIZE >>> 
+		( input, target, rows, num_classes, indicators ); 
+	cudaThreadSynchronize ();  
+	cudaCheckError (); 
+		
+	reduce( indicators, rows, pageLckPtr ); 
+	
+	return *pageLckPtr; 
+}
+

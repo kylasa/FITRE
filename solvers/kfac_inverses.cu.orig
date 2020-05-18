@@ -1,0 +1,593 @@
+
+#include <solvers/kfac_inverses.h>
+#include <solvers/kfac_utils.h>
+
+#include <device/cuda_utils.h>
+#include <device/device_defines.h>
+#include <device/handles.h>
+
+#include <core/errors.h>
+
+#include <functions/dev_image.h>
+#include <functions/dev_initializations.h>
+#include <functions/dev_backprop_convolution.h>
+
+#include <utilities/print_utils.h>
+
+/*
+https://stackoverflow.com/questions/28794010/solving-dense-linear-systems-ax-b-with-cuda
+https://devtalk.nvidia.com/default/topic/767806/gpu-accelerated-libraries/matrix-inversion-with-cublassgetri/
+*/
+
+GLOBAL void ker_init_last_row( real *mat, int rows, int cols, real value )
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+
+	if (idx < cols) {
+		mat[ idx * rows + rows - 1 ] = value; 
+	}
+}
+
+GLOBAL void ker_add_regularization( real *mat, int rows, real scale )
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+	
+	if ( idx < rows ) {
+		mat[ idx + idx * rows ] += scale; 
+	}
+}
+
+real group_products( real *mat, int numElements )
+{
+	real sum = 0; 
+
+	cublasCheckError( cublasDdot( cublasHandle, numElements, mat, 1, mat, 1, &sum )); 
+
+	return sqrt( sum ); 
+}
+
+void initKFACData( CNN_MODEL *model, KFAC_CURVATURE_INFO *kfac_info )
+{
+	int *omegaOffsets = kfac_info->OmegaZOffsets; 
+	int *lambdaOffsets = kfac_info->LambdaGOffsets; 
+
+	int zRows, zCols; 
+
+	for (int l = 0; l < model->cLayers; l ++){
+		CONV_LAYER *convLayer = &model->convLayer[ l ]; 
+
+		zRows = model->batchSize * convLayer->outHeight * convLayer->outWidth; 
+		zCols = convLayer->inChannels * convLayer->kSize * convLayer->kSize + 1; 
+
+		cuda_memset( kfac_info->OmegaZZT + omegaOffsets[ l ], 0, sizeof(real) * zCols * zCols, 
+							ERROR_MEMSET ); 
+
+		cuda_memset( kfac_info->LambdaGGT + lambdaOffsets[ l ], 0, 
+					sizeof(real) * convLayer->outChannels * convLayer->outChannels, ERROR_MEMSET ); 
+	}
+
+	for (int l = 0; l < model->lLayers; l ++) {
+		FC_LAYER *ll = &model->fcLayer[ l ]; 
+
+		cuda_memset( kfac_info->OmegaZZT + omegaOffsets[ model->cLayers + l ], 0, 
+				sizeof(real) * (ll->in + 1) * (ll->in + 1), ERROR_MEMSET ); 
+
+		cuda_memset( kfac_info->LambdaGGT + lambdaOffsets[ model->cLayers + l ], 0, 
+				sizeof(real) * ll->out * ll->out, ERROR_MEMSET ); 
+	}
+}
+
+
+void updateRunningStats( real *src, real *update, int numElements, real momentum )
+{
+
+	real alpha; 
+
+	//	theta *= momentum / (1 - momentum )
+	// theta += udpate
+	// theta *= 1 - momentum
+	if (momentum != 0) {
+		alpha = momentum / (1. - momentum ); 
+		cublasCheckError( cublasDscal( cublasHandle, numElements, &alpha, src, 1 ) ); 
+
+		alpha = 1.; 
+		cublasCheckError( cublasDaxpy( cublasHandle, numElements, &alpha, update, 1, src, 1 ) ); 
+
+		alpha = 1. - momentum; 
+		cublasCheckError( cublasDscal( cublasHandle, numElements, &alpha, src, 1 ) ); 
+	} else {
+		copy_device( src, update, sizeof(real) * numElements, ERROR_MEMCPY_DEVICE_DEVICE ); 
+	}
+}
+
+/*
+
+Here Damping and Regularization is added to the ZZT before we take inverse. 
+
+*/
+
+void computeMatrixInverse (real *matrix, real *inverse, int n, real *devPtr, real *hostPtr, real *pageLckPtr, 
+	real lambda, real dampGamma )
+{
+	//real *ZPtr = matrix;
+	real *ZPtr = devPtr;
+	real *ZInvPtr = inverse; 
+
+	int *infoArray = (int *)pageLckPtr; 
+	int *pivotArray = (int *)(devPtr + n*n); 
+	int *nextDevPtr = pivotArray + n + (n % 32); 
+
+	real **ZArr = (real **) nextDevPtr;
+	real **ZInvArr = ZArr + 4; 
+
+	real scale = 0; 
+	int blocks; 
+
+	copy_device( devPtr, matrix, sizeof(real) * n * n, ERROR_MEMCPY_DEVICE_DEVICE ); 
+
+	//Add the Damping Term here along with Regularization term here. 
+	scale = lambda + dampGamma; 
+
+	blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+	ker_add_regularization <<< blocks, BLOCK_SIZE >>> 
+		( devPtr, n, scale ); 
+	cudaThreadSynchronize (); 
+	cudaCheckError (); 
+
+/*
+copy_host_device( hostPtr, devPtr, sizeof(real) * 10, cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+for (int i = 0; i < 10; i ++ )
+	fprintf( stderr, " %e ", hostPtr[ i ] ); 
+fprintf( stderr, "\n"); 
+*/
+
+real temp = 0, sum = 0; 
+cublasCheckError( cublasDnrm2( cublasHandle, n * n, devPtr, 1, &temp ) ); 
+cublasCheckError( cublasDasum( cublasHandle, n * n, devPtr, 1, &sum )); 
+fprintf( stderr, "Dnrm2( ., 2) --> %e, sum: %e \n", temp, sum ) ;
+
+
+
+	//In place LU factorization here. 
+	infoArray[ 0 ] = 0; 
+	copy_host_device( &ZPtr, ZArr, sizeof(real *), cudaMemcpyHostToDevice, ERROR_MEMCPY_HOST_DEVICE ); 
+	cublasCheckError( cublasDgetrfBatched( cublasHandle, n, ZArr, n, pivotArray, infoArray, 1 ) ); 
+
+	if (infoArray[ 0 ] != 0) {
+		fprintf( stderr, "ComputeMatrixInverse: Problem with LU Decomposition .... %d \n", infoArray[ 0 ]); 
+		exit ( -1 ); 
+	}
+
+	// out of place inverseion here. 
+	copy_host_device( &ZInvPtr, ZInvArr, sizeof(real *), cudaMemcpyHostToDevice, ERROR_MEMCPY_HOST_DEVICE ); 
+	infoArray[ 0 ] = 0; 
+	cublasCheckError( cublasDgetriBatched( cublasHandle, n, (const real **)ZArr, n, pivotArray, ZInvArr, n, infoArray, 1 ) ); 
+
+	if (infoArray[ 0 ] != 0) {
+		fprintf( stderr, "ComputeMatrixInverse: Problem with Matrix Inversion.... %d\n", infoArray[ 0 ]); 
+		exit ( -1 ); 
+	}
+}
+
+void printNorms( CNN_MODEL *model, KFAC_CURVATURE_INFO *kfac_info )
+{
+	int *omegaOffsets = kfac_info->OmegaZOffsets; 
+	int *lambdaOffsets = kfac_info->LambdaGOffsets; 
+
+	real pageLckPtr = 0; 
+	int zRows, zCols; 
+
+	for (int l = 0; l < model->cLayers; l ++){
+		CONV_LAYER *convLayer = &model->convLayer[ l ]; 
+
+		zRows = model->batchSize * convLayer->outHeight * convLayer->outWidth; 
+		zCols = convLayer->inChannels * convLayer->kSize * convLayer->kSize + 1; 
+
+		cublasCheckError( cublasDnrm2( cublasHandle, zCols * zCols, 
+									kfac_info->OmegaZInv + omegaOffsets[ l ], 1, &pageLckPtr )); 
+		fprintf( stderr, "OmegaZ Layer: %d, Norm( inverse ZZT, 2 ): %e\n", l, pageLckPtr); 
+
+		cublasCheckError( cublasDnrm2( cublasHandle, convLayer->outChannels * convLayer->outChannels, 
+							kfac_info->LambdaGInv + lambdaOffsets[ l ], 1, &pageLckPtr )); 
+		fprintf( stderr, "LambdaDelta Layer: %d, Done with inverses. Norm( ., 2 ): %f \n", l, pageLckPtr ); 
+	}
+
+	for (int l = 0; l < model->lLayers; l ++) {
+		FC_LAYER *ll = &model->fcLayer[ l ]; 
+
+		pageLckPtr = 0; 
+		cublasCheckError( cublasDnrm2( cublasHandle, (ll->in + 1) * (ll->in + 1), 
+									kfac_info->OmegaZInv + omegaOffsets[ model->cLayers + l ], 1, &pageLckPtr )); 
+		fprintf( stderr, "OmegaZ Layer: %d, Norm( inverse ZZT, 2 ): %f\n", l, pageLckPtr); 
+
+		pageLckPtr = 0; 
+		cublasCheckError( cublasDnrm2( cublasHandle, ll->out * ll->out, 
+							kfac_info->LambdaGInv + lambdaOffsets[ model->cLayers + l ], 1, &pageLckPtr )); 
+		fprintf( stderr, "LambdaDelta Layer: %d, Done with inverses. Norm( ., 2 ): %f \n", l, pageLckPtr ); 
+	}
+}
+
+
+void computeOmegaZ( KFAC_CURVATURE_INFO *kfac_info, CNN_MODEL *model, 
+	DEVICE_DATASET *data, int offset, int samples, real *z, 
+	int *zOffsets, real *devPtr, real *hostPtr, real *pageLckPtr, 
+	int iterCount)
+{
+
+	real *dataset = NULL; 
+
+	real *expandedMatrix; 
+	real *zMatrix; 
+	real alpha, beta; 
+	const real **matPtr; 
+	real **invMatPtr; 
+	real *tmp; 
+
+	real *nextDevPtr;
+	real *nextDevPtr2; 
+	real *nextHostPtr;
+
+	int inputOffset; 
+
+	int zRows, zCols; 
+	int blocks; 
+	int *omegaOffsets = kfac_info->OmegaZOffsets; 
+
+	/*
+		Convolution Layers **
+		n * h * w X inC
+
+		Expanded form as 
+		n * h * w X inC * k * k
+
+		result of Z^T Z --> inC * k * k X inC * k * k
+	*/
+	for (int l = 0; l < model->cLayers; l ++){
+
+		CONV_LAYER *convLayer = &model->convLayer[ l ]; 
+		POOL_LAYER *poolLayer = &model->poolLayer[ l ]; 
+
+		if (l == 0) dataset = data->trainSetX + offset * data->features;	
+		else {
+			CONV_LAYER *prevLayer = &model->convLayer[ l - 1 ]; 
+			dataset = z + zOffsets[ l ] + prevLayer->outputOffset; 
+		}
+
+		zRows = samples * convLayer->outHeight * convLayer->outWidth; 
+		zCols = convLayer->inChannels * convLayer->kSize * convLayer->kSize + 1; 
+
+		expandedMatrix = devPtr; 
+		nextDevPtr = expandedMatrix + zRows * zCols;
+
+		//Expanded Form here. 
+		getBatchImageCols( dataset, samples, convLayer->inChannels, 
+			convLayer->height, convLayer->width, convLayer->kSize, convLayer->padding, 
+			convLayer->stride, expandedMatrix); 
+
+cublasCheckError( cublasDnrm2( cublasHandle, zRows * (zCols - 1), expandedMatrix, 1, hostPtr ) ); 
+fprintf( stderr, "Norm of expandedZ: %.10f\n", *hostPtr ); 
+
+		alpha = 1./(real)(convLayer->outHeight * convLayer->outWidth); 
+		cublasCheckError( cublasDscal( cublasHandle, zRows * (zCols-1), &alpha, expandedMatrix, 1 ) ); 
+
+		//Bias 
+		blocks  = ( zRows  + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+		kerInitOneVector <<< blocks, BLOCK_SIZE >>>
+			(expandedMatrix + zRows * (zCols - 1), zRows); 
+		cudaThreadSynchronize (); 
+		cudaCheckError (); 
+
+/*
+fprintf( stderr, "Z for layer: %d is --> \n", l ); 
+copy_host_device( hostPtr, expandedMatrix, sizeof(real) * zRows * zCols, cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, zRows, zCols ); 
+*/
+
+
+		//compute Z^T * Z
+		// (inC * k * k + 1 X n * h * w) X (n * h * w X inC * k * k + 1) 
+		alpha = 1.; beta = 0; 
+		cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, 
+					zCols, // m lda( Z^T )	
+					zCols, //n columns of Z^T, rows of Z
+					zRows, // k
+					&alpha, expandedMatrix, zRows, expandedMatrix, zRows,
+					&beta, nextDevPtr, zCols) ); 
+
+		//Scale  
+		alpha = 1./(real)samples;
+		cublasCheckError( cublasDscal( cublasHandle, zCols * zCols, &alpha, nextDevPtr, 1 ) ); 
+
+//fprintf( stderr, "Done with ZZT... %d\n", zCols * zCols); 
+
+
+		/*
+		if (iterCount == 0) {
+			copy_device( kfac_info->OmegaZZT + omegaOffsets[ l ], nextDevPtr, 
+				sizeof(real) * zCols * zCols, ERROR_MEMCPY_DEVICE_DEVICE ); 
+		}
+		*/
+
+		// Update the Momentum Term here. 
+		// And use the updated momentum term to compute the inverse
+		// Inverse is stored and is used to compute Natural Gradient. 
+		updateRunningStats( kfac_info->OmegaZZT + omegaOffsets[ l ], nextDevPtr, 
+			zCols * zCols, iterCount ? kfac_info->stats_decay : 0 ); 
+
+		//compute the Inverse of INVERSE( Z^T * Z )
+		computeMatrixInverse( kfac_info->OmegaZZT + omegaOffsets[ l ], kfac_info->OmegaZInv + omegaOffsets[ l ], 
+										zCols, devPtr, hostPtr, pageLckPtr, 
+									kfac_info->regLambda, kfac_info->dampGamma ) ; 
+//fprintf( stderr, "Done with ZZT Inv... %d\n", zCols * zCols); 
+
+/*
+fprintf( stderr, "ZZT for layer: %d is -- > \n", l); 
+copy_host_device( hostPtr,  kfac_info->OmegaZZT + omegaOffsets[ l ], sizeof(real) * zCols * zCols, cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, zCols, zCols ); 
+
+fprintf( stderr, "Inv(ZZT) for layer: %d is -- > \n", l); 
+copy_host_device( hostPtr,  kfac_info->OmegaZInv + omegaOffsets[ l ], sizeof(real) * zCols * zCols, cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, zCols, zCols ); 
+*/
+
+	}
+
+	//Inverses for the Linear Layers here. 
+	for (int l = 0; l < model->lLayers; l ++) {
+//fprintf( stderr, "Starting for layer: %d \n", l ); 
+
+		FC_LAYER *ll = &model->fcLayer[ l ]; 
+		if (l == 0) {
+			CONV_LAYER *c =  &( model->convLayer[ model->cLayers - 1 ] ); 
+			POOL_LAYER *p = &( model->poolLayer[ model->cLayers - 1 ] ); 
+			/*
+			inputOffset = c->outputOffset; 
+			real *temp = z + zOffsets[ model->cLayers + l ] + inputOffset; 
+
+			//reshape is needed here.
+			dataset = devPtr; 
+			zMatrix = dataset + ll->in * samples; 
+			nextDevPtr = zMatrix + (ll->in + 1) * samples;
+			reshapeMatrix( temp, samples, c->outChannels, p->outHeight * p->outWidth, dataset); 
+			*/
+			dataset = z + zOffsets[ model->cLayers + l ] + c->outputOffset; 
+			zMatrix = devPtr; 
+			nextDevPtr = zMatrix + (ll->in + 1) * samples;
+			nextDevPtr2 = nextDevPtr + (ll->in + 1) * samples; 
+
+		} else {
+			dataset = z + zOffsets[ model->cLayers + l ] ; 
+			zMatrix = devPtr; 
+			nextDevPtr = zMatrix + (ll->in + 1) * samples;
+			nextDevPtr2 = nextDevPtr + (ll->in + 1) * samples; 
+		}
+
+		//compute Z^T * Z
+		cudaMemcpy2D( 	zMatrix, sizeof(real) * (ll->in + 1), 
+							dataset , sizeof(real) * ll->in, 
+							sizeof(real) * ll->in , sizeof(real) * samples, 
+							cudaMemcpyDeviceToDevice ) ;
+		/*
+		cudaMemcpy2D( 	zMatrix, sizeof(real) * (ll->in + 1), 
+							dataset , sizeof(real) * ll->in, 
+							sizeof(real) * ll->in,  // columns in bytes
+							samples, 						 // rows
+							cudaMemcpyDeviceToDevice ) ;
+		*/
+		cudaCheckError (); 
+//fprintf( stderr, "Done with Memcpy 2D..\n"); 
+
+		blocks = (samples + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+		ker_init_last_row <<< blocks, BLOCK_SIZE >>> 
+				( zMatrix, ll->in + 1, samples, 1 ); 
+		cudaThreadSynchronize (); 
+		cudaCheckError (); 
+
+cublasCheckError( cublasDnrm2( cublasHandle, (ll->in + 1) * samples, zMatrix, 1, hostPtr) ); 
+fprintf( stderr, "Norm( Z, 2) == %.10f \n", *hostPtr); 
+
+		copy_device( nextDevPtr2, zMatrix, sizeof(real) * (ll->in + 1) * samples, ERROR_MEMCPY_DEVICE_DEVICE ); 
+
+		//Scale
+		alpha = 1./ (real)(samples); 
+		cublasCheckError( cublasDscal( cublasHandle, (ll->in + 1) * samples, &alpha, nextDevPtr2, 1));
+
+//fprintf (stderr, "Starting zzT now.. .\n" ); 
+
+
+		//Z * Z^T
+		alpha = 1.; beta = 0; 
+		cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T, 
+									ll->in + 1, ll->in + 1, samples,
+									&alpha, zMatrix, ll->in + 1, nextDevPtr2, ll->in + 1, 
+									&beta, nextDevPtr, ll->in + 1 ) ); 
+//fprintf( stderr, "Done with ZZT Lin... %d\n", (ll->in + 1)*(ll->in + 1)); 
+
+cublasCheckError( cublasDnrm2( cublasHandle, (ll->in + 1) * (ll->in + 1), nextDevPtr, 1, hostPtr) ); 
+fprintf( stderr, "Norm( ZZT, 2) == %.10f \n", *hostPtr); 
+
+		/*
+		if (iterCount == 0) {
+			copy_device( kfac_info->OmegaZZT + omegaOffsets[ model->cLayers + l ], nextDevPtr, 
+					sizeof(real) * (ll->in + 1) * (ll->in + 1), ERROR_MEMCPY_DEVICE_DEVICE ); 
+		}
+		*/
+
+		updateRunningStats( kfac_info->OmegaZZT + omegaOffsets[ model->cLayers + l ], 
+				nextDevPtr, (ll->in + 1) * (ll->in + 1), iterCount ? kfac_info->stats_decay : 0 ); 
+
+		// Inverse
+		computeMatrixInverse( kfac_info->OmegaZZT + omegaOffsets[ model->cLayers + l ], 
+									kfac_info->OmegaZInv + omegaOffsets[ model->cLayers + l ], 
+										ll->in + 1, devPtr, hostPtr, pageLckPtr, 
+									kfac_info->regLambda, kfac_info->dampGamma ) ; 
+//fprintf( stderr, "Done with ZZT Lin (inv)... %d\n", (ll->in + 1) * (ll->in + 1)); 
+/*
+fprintf( stderr, "Z for layer: %d is ... \n"); 
+copy_host_device( hostPtr, zMatrix, sizeof(real) * (ll->in + 1) * samples, cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, ll->in + 1, samples ); 
+*/
+
+/*
+fprintf( stderr, "ZZT for layer: %d is... \n", model->cLayers + l ); 
+copy_host_device( hostPtr,  kfac_info->OmegaZZT + omegaOffsets[ model->cLayers + l ], sizeof(real) * (ll->in + 1) * (ll->in + 1), cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, ll->in + 1, ll->in + 1 ); 
+
+fprintf( stderr, "Inv(ZZT) for layer: %d is... \n", model->cLayers + l ); 
+copy_host_device( hostPtr,  kfac_info->OmegaZInv + omegaOffsets[ model->cLayers + l ], sizeof(real) * (ll->in + 1) * (ll->in + 1), cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, ll->in + 1, ll->in + 1 ); 
+*/
+	}
+
+}
+
+//  There is no Bias for this term here. 
+void computeLambdaDelta( KFAC_CURVATURE_INFO *kfac_info, CNN_MODEL *model, 
+	int samples, real *dx, 
+	int *zOffsets, real *devPtr, real *hostPtr, real *pageLckPtr, 
+	int iterCount ) 
+{
+	real *nextDevPtr = devPtr;
+	real *nextHostPtr = hostPtr;
+	real *delta; 
+	real *nextDevPtr2;
+
+	const real **matPtr; 
+	real **invMatPtr; 
+	real *tmp; 
+
+	real alpha, beta; 
+
+	int *lambdaOffsets = kfac_info->LambdaGOffsets; 
+	int *omegaOffsets = kfac_info->OmegaZOffsets; 
+
+	for (int l = 0; l < model->cLayers; l ++) {
+		CONV_LAYER *convLayer = &model->convLayer[ l ]; 
+
+		//Delta dimensions -- n * h * w X outChannels
+		delta = dx + zOffsets[ l + 1 ] + convLayer->activationOffset; 	
+/*
+fprintf( stderr, "... computing the delta inversees... \n"); 
+copy_host_device( hostPtr, delta, sizeof(real) * convLayer->outHeight * convLayer->outWidth * convLayer->outChannels * samples, cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, convLayer->outHeight * convLayer->outWidth * samples, convLayer->outChannels ); 
+*/
+
+		alpha = convLayer->outHeight * convLayer->outWidth * samples;
+		cublasCheckError( cublasDscal( cublasHandle, 
+			convLayer->outChannels * convLayer->outHeight * convLayer->outWidth * samples, &alpha, 
+													delta, 1 ) ); 
+
+		nextDevPtr2 = nextDevPtr + convLayer->outChannels * convLayer->outChannels; 
+		copy_device( nextDevPtr2, delta, sizeof(real) * convLayer->outHeight * convLayer->outWidth * samples * convLayer->outChannels, 
+							ERROR_MEMCPY_DEVICE_DEVICE ); 
+
+		alpha = 1./(real)(samples * convLayer->outWidth * convLayer->outHeight);
+		cublasCheckError( cublasDscal( cublasHandle, 
+				convLayer->outChannels * samples * convLayer->outWidth * convLayer->outHeight, 
+				&alpha, nextDevPtr2, 1 ) ); 
+
+/*
+fprintf( stderr, "... computing(G) the delta inversees... \n"); 
+copy_host_device( hostPtr, delta, sizeof(real) * convLayer->outHeight * convLayer->outWidth * convLayer->outChannels * samples, cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, convLayer->outHeight * convLayer->outWidth * samples, convLayer->outChannels ); 
+*/
+
+		// G^T * G --> outCHannels * outCHannels are the dimensions of the results
+		alpha = 1.; beta = 0.; 
+		cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, 
+										convLayer->outChannels, convLayer->outChannels, 
+										samples * convLayer->outHeight * convLayer->outWidth, 
+										&alpha, delta, samples * convLayer->outHeight * convLayer->outWidth, 
+										nextDevPtr2, samples * convLayer->outHeight * convLayer->outWidth, 
+										&beta, nextDevPtr, convLayer->outChannels ) ); 
+
+		/*
+		if (iterCount == 0) {
+			copy_device( kfac_info->LambdaGGT + lambdaOffsets[ l ], nextDevPtr, 
+					sizeof(real) * convLayer->outChannels * convLayer->outChannels, ERROR_MEMCPY_DEVICE_DEVICE ); 
+		}
+		*/
+
+		//momentum term here. 
+		updateRunningStats( kfac_info->LambdaGGT + lambdaOffsets[ l ], nextDevPtr, 
+			convLayer->outChannels * convLayer->outChannels, iterCount ? kfac_info->stats_decay : 0 ); 
+
+/*
+fprintf( stderr, "GGT is --> \n"); 
+copy_host_device( hostPtr, kfac_info->LambdaGGT + lambdaOffsets[ l ], 
+		sizeof(real) * convLayer->outChannels * convLayer->outChannels, 
+		cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, convLayer->outChannels , convLayer->outChannels ); 
+*/
+
+
+		//Inverse of G^T * G Here. 
+		computeMatrixInverse( kfac_info->LambdaGGT + lambdaOffsets[ l ], kfac_info->LambdaGInv + lambdaOffsets[ l ], 
+										convLayer->outChannels, nextDevPtr, hostPtr, pageLckPtr, 
+					kfac_info->regLambda, kfac_info->dampGamma); 
+
+/*
+fprintf( stderr, "Inv. GGT is --> \n"); 
+copy_host_device( hostPtr, kfac_info->LambdaGInv  + lambdaOffsets[ l ], 
+		sizeof(real) * convLayer->outChannels * convLayer->outChannels, 
+		cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, convLayer->outChannels , convLayer->outChannels ); 
+*/
+	}
+
+
+	for (int l = 0; l < model->lLayers; l ++) {
+		FC_LAYER *fcLayer = &model->fcLayer[ l ]; 
+
+		// delta --> shape is fcLayer->out * n
+		delta = dx + zOffsets[ model->cLayers + l + 1 ]; 
+
+		// delta * delta ^T
+		alpha = 1; beta = 0; 
+		cublasCheckError( cublasDgemm( cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T, 
+									fcLayer->out, fcLayer->out, samples, 
+									&alpha, delta, fcLayer->out, delta, fcLayer->out, 
+									&beta, nextDevPtr, fcLayer->out )); 
+
+		//TODO --- Since we are using Size_Average = True. 
+		//				dx terms are scaled by the number of data points... 
+		// 		 which changes the alpha here. 
+		//alpha = (real)samples / (real)(samples * samples); 
+		alpha = (real) samples; 
+		cublasCheckError( cublasDscal( cublasHandle, fcLayer->out * fcLayer->out, &alpha, nextDevPtr, 1 ) ); 
+
+		/*
+		if (iterCount == 0) {
+			copy_device( kfac_info->LambdaGGT + lambdaOffsets[ model->cLayers + l ], nextDevPtr, 
+								sizeof(real) * fcLayer->out * fcLayer->out, ERROR_MEMCPY_DEVICE_DEVICE ); 
+		}
+		*/
+
+		updateRunningStats( kfac_info->LambdaGGT + lambdaOffsets[ model->cLayers + l ], 
+									nextDevPtr, fcLayer->out * fcLayer->out, iterCount ? kfac_info->stats_decay : 0 ); 
+
+/*
+fprintf( stderr, "GGT ... \n"); 
+copy_host_device( hostPtr, kfac_info->LambdaGGT + lambdaOffsets[ model->cLayers + l ], 
+		sizeof(real) * fcLayer->out * fcLayer->out, cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, fcLayer->out, fcLayer->out); 
+*/
+
+		//Inverse of ( delta * delta^T )
+		computeMatrixInverse( kfac_info->LambdaGGT + lambdaOffsets[ model->cLayers + l ], 
+									kfac_info->LambdaGInv + lambdaOffsets[ model->cLayers + l ], 
+									fcLayer->out, nextDevPtr, hostPtr,  pageLckPtr, 
+									kfac_info->regLambda, kfac_info->dampGamma ); 	
+
+/*
+fprintf( stderr, "Inv. GGT ... \n"); 
+copy_host_device( hostPtr, kfac_info->LambdaGInv + lambdaOffsets[ model->cLayers + l ], 
+		sizeof(real) * fcLayer->out * fcLayer->out, cudaMemcpyDeviceToHost, ERROR_MEMCPY_DEVICE_HOST ); 
+print2DMatrix( hostPtr, fcLayer->out, fcLayer->out); 
+*/
+	}
+
+
+	//printNorms( model, kfac_info ); 
+
+}
